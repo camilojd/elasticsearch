@@ -19,6 +19,7 @@
 
 package org.elasticsearch.index.store;
 
+import org.apache.lucene.codecs.Codec;
 import org.apache.lucene.codecs.CodecUtil;
 import org.apache.lucene.index.CorruptIndexException;
 import org.apache.lucene.index.IndexCommit;
@@ -28,6 +29,7 @@ import org.apache.lucene.index.IndexFormatTooOldException;
 import org.apache.lucene.index.IndexNotFoundException;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.SegmentCommitInfo;
+import org.apache.lucene.index.SegmentInfo;
 import org.apache.lucene.index.SegmentInfos;
 import org.apache.lucene.store.AlreadyClosedException;
 import org.apache.lucene.store.BufferedChecksum;
@@ -49,6 +51,7 @@ import org.elasticsearch.ElasticsearchException;
 import org.elasticsearch.ExceptionsHelper;
 import org.elasticsearch.common.Strings;
 import org.elasticsearch.common.bytes.BytesReference;
+import org.elasticsearch.common.collect.ImmutableOpenMap;
 import org.elasticsearch.common.collect.Tuple;
 import org.elasticsearch.common.inject.Inject;
 import org.elasticsearch.common.io.Streams;
@@ -85,6 +88,7 @@ import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.sql.Time;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -158,7 +162,7 @@ public class Store extends AbstractIndexShardComponent implements Closeable, Ref
         this.shardLock = shardLock;
         this.onClose = onClose;
         final TimeValue refreshInterval = indexSettings.getValue(INDEX_STORE_STATS_REFRESH_INTERVAL_SETTING);
-        this.statsCache = new StoreStatsCache(refreshInterval, directory, directoryService);
+        this.statsCache = new StoreStatsCache(refreshInterval, directoryService, this);
         logger.debug("store stats are refreshed with refresh_interval [{}]", refreshInterval);
 
         assert onClose != null;
@@ -1546,35 +1550,113 @@ public class Store extends AbstractIndexShardComponent implements Closeable, Ref
     }
 
     private static class StoreStatsCache extends SingleObjectCache<StoreStats> {
-        private final Directory directory;
+        private final Store store;
         private final DirectoryService directoryService;
 
-        public StoreStatsCache(TimeValue refreshInterval, Directory directory, DirectoryService directoryService) throws IOException {
-            super(refreshInterval, new StoreStats(estimateSize(directory), directoryService.throttleTimeInNanos()));
-            this.directory = directory;
+        public StoreStatsCache(TimeValue refreshInterval, DirectoryService directoryService, Store store) throws IOException {
+            super(refreshInterval, estimateSize(store, directoryService.throttleTimeInNanos()));
+            this.store = store;
             this.directoryService = directoryService;
         }
 
         @Override
         protected StoreStats refresh() {
             try {
-                return new StoreStats(estimateSize(directory), directoryService.throttleTimeInNanos());
+                return estimateSize(store, directoryService.throttleTimeInNanos());
             } catch (IOException ex) {
                 throw new ElasticsearchException("failed to refresh store stats", ex);
             }
         }
 
-        private static long estimateSize(Directory directory) throws IOException {
+        private static StoreStats estimateSize(Store store, final long throttleTimeInNanos) throws IOException {
             long estimatedSize = 0;
-            String[] files = directory.listAll();
+            Directory storeDirectory = store.directory();
+            String[] files = new String[0];
+            try {
+                files = storeDirectory.listAll();
+            } catch (IOException e) {
+                store.logger.warn("Couldn't list Store Directory [{}]", e, storeDirectory);
+            }
+
+            boolean segmentsFileExists = false;
             for (String file : files) {
                 try {
-                    estimatedSize += directory.fileLength(file);
+                    estimatedSize += storeDirectory.fileLength(file);
+                    if (file.startsWith(IndexFileNames.SEGMENTS)) {
+                        segmentsFileExists = true;
+                    }
                 } catch (NoSuchFileException | FileNotFoundException e) {
                     // ignore, the file is not there no more
                 }
             }
-            return estimatedSize;
+
+            StoreStats basicStoreStats = new StoreStats(estimatedSize, ImmutableOpenMap.of(), throttleTimeInNanos);
+            if (!segmentsFileExists) {
+                return basicStoreStats;
+            }
+
+            ImmutableOpenMap.Builder<String, Long> map = ImmutableOpenMap.builder();
+            SegmentInfos segmentInfos = null;
+            try {
+                segmentInfos = store.readLastCommittedSegmentsInfo();
+            } catch (IOException e) {
+                store.logger.warn("Unable to retrieve segment infos", e);
+                return basicStoreStats;
+            }
+
+            for (SegmentCommitInfo segmentCommitInfo : segmentInfos) {
+                Directory directory = null;
+                boolean useCompoundFile = segmentCommitInfo.info.getUseCompoundFile();
+                if (useCompoundFile) {
+                    try {
+                        directory = segmentCommitInfo.info.getCodec().compoundFormat()
+                                        .getCompoundReader(segmentCommitInfo.info.dir, segmentCommitInfo.info, IOContext.READ);
+                    } catch (IOException e) {
+                        store.logger.warn("Error when opening compound reader for Directory [{}] and SegmentCommitInfo [{}]", e,
+                                          segmentCommitInfo.info.dir, segmentCommitInfo);
+                    }
+                } else {
+                    directory = segmentCommitInfo.info.dir;
+                }
+
+                // Couldn't open compound reader, skip
+                if (directory == null) {
+                    continue;
+                }
+
+                files = new String[0];
+                try {
+                    files = directory.listAll();
+                } catch (IOException e) {
+                    store.logger.warn("Couldn't list Directory [{}]", e, directory);
+                }
+
+                for (String file : files) {
+                    String extension = IndexFileNames.getExtension(file);
+                    if (extension == null) {
+                        continue;
+                    }
+
+                    try {
+                        long length = directory.fileLength(file);
+                        map.put(extension, length);
+                    } catch (NoSuchFileException | FileNotFoundException e) {
+                        store.logger.trace("Tried to query fileLength but file is gone, Directory [{}], file [{}]", e, directory, file);
+                    } catch (IOException e) {
+                        store.logger.warn("Error when trying to query fileLength in Directory [{}] and file [{}]", e, directory, file);
+                    }
+                }
+
+                if (useCompoundFile && directory != null) {
+                    try {
+                        directory.close();
+                    } catch (IOException e) {
+                        store.logger.warn("Error when closing compound reader on Directory [{}]", e, directory);
+                    }
+                }
+            }
+
+            return new StoreStats(estimatedSize, map.build(), throttleTimeInNanos);
         }
     }
 

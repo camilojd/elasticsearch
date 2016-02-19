@@ -19,6 +19,10 @@
 
 package org.elasticsearch.index.store;
 
+import com.carrotsearch.hppc.cursors.ObjectObjectCursor;
+
+import org.elasticsearch.Version;
+import org.elasticsearch.common.collect.ImmutableOpenMap;
 import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.common.io.stream.StreamOutput;
 import org.elasticsearch.common.io.stream.Streamable;
@@ -29,6 +33,7 @@ import org.elasticsearch.common.xcontent.XContentBuilder;
 import org.elasticsearch.common.xcontent.XContentBuilderString;
 
 import java.io.IOException;
+import java.util.Iterator;
 
 /**
  */
@@ -36,14 +41,37 @@ public class StoreStats implements Streamable, ToXContent {
 
     private long sizeInBytes;
 
+    private ImmutableOpenMap<String, Long> detail = ImmutableOpenMap.of();
+
     private long throttleTimeInNanos;
+
+    private static ImmutableOpenMap<String, String> descriptions = ImmutableOpenMap.<String, String>builder()
+            .fPut("si", "Segment Info")
+            .fPut("fnm", "Fields")
+            .fPut("fdx", "Field Index")
+            .fPut("fdt", "Field Data")
+            .fPut("tim", "Term Dictionary")
+            .fPut("tip", "Term Index")
+            .fPut("doc", "Frequencies")
+            .fPut("pos", "Positions")
+            .fPut("pay", "Payloads")
+            .fPut("nvd", "Norms")
+            .fPut("nvm", "Norms")
+            .fPut("dvd", "DocValues")
+            .fPut("dvm", "DocValues")
+            .fPut("tvx", "Term Vector Index")
+            .fPut("tvd", "Term Vector Documents")
+            .fPut("tvf", "Term Vector Fields")
+            .fPut("liv", "Live Documents")
+            .build();
 
     public StoreStats() {
 
     }
 
-    public StoreStats(long sizeInBytes, long throttleTimeInNanos) {
+    public StoreStats(long sizeInBytes, ImmutableOpenMap<String, Long> detail, long throttleTimeInNanos) {
         this.sizeInBytes = sizeInBytes;
+        this.detail = detail;
         this.throttleTimeInNanos = throttleTimeInNanos;
     }
 
@@ -52,9 +80,21 @@ public class StoreStats implements Streamable, ToXContent {
             return;
         }
         sizeInBytes += stats.sizeInBytes;
+
+        ImmutableOpenMap.Builder<String, Long> map = ImmutableOpenMap.builder(this.detail);
+        for (Iterator<ObjectObjectCursor<String, Long>> it = stats.detail.iterator(); it.hasNext();) {
+            ObjectObjectCursor<String, Long> entry = it.next();
+            if (map.containsKey(entry.key)) {
+                long oldValue = map.get(entry.key);
+                map.put(entry.key, oldValue + entry.value);
+            } else {
+                map.put(entry.key, entry.value);
+            }
+        }
+
+        this.detail = map.build();
         throttleTimeInNanos += stats.throttleTimeInNanos;
     }
-
 
     public long sizeInBytes() {
         return sizeInBytes;
@@ -90,12 +130,30 @@ public class StoreStats implements Streamable, ToXContent {
     public void readFrom(StreamInput in) throws IOException {
         sizeInBytes = in.readVLong();
         throttleTimeInNanos = in.readVLong();
+        if (in.getVersion().onOrAfter(Version.V_3_0_0)) {
+            int size = in.readVInt();
+            ImmutableOpenMap.Builder<String, Long> map = ImmutableOpenMap.builder(size);
+            for (int i = 0; i < size; i++) {
+                String key = in.readString();
+                Long value = in.readLong();
+                map.put(key, value);
+            }
+            detail = map.build();
+        }
     }
 
     @Override
     public void writeTo(StreamOutput out) throws IOException {
         out.writeVLong(sizeInBytes);
         out.writeVLong(throttleTimeInNanos);
+        if (out.getVersion().onOrAfter(Version.V_3_0_0)) {
+            out.writeVInt(detail.size());
+            for (Iterator<ObjectObjectCursor<String, Long>> it = detail.iterator(); it.hasNext();) {
+                ObjectObjectCursor<String, Long> entry = it.next();
+                out.writeString(entry.key);
+                out.writeLong(entry.value);
+            }
+        }
     }
 
     @Override
@@ -103,6 +161,15 @@ public class StoreStats implements Streamable, ToXContent {
         builder.startObject(Fields.STORE);
         builder.byteSizeField(Fields.SIZE_IN_BYTES, Fields.SIZE, sizeInBytes);
         builder.timeValueField(Fields.THROTTLE_TIME_IN_MILLIS, Fields.THROTTLE_TIME, throttleTime());
+        builder.startObject(Fields.DETAIL);
+        for (Iterator<ObjectObjectCursor<String, Long>> it = detail.iterator(); it.hasNext();) {
+            ObjectObjectCursor<String, Long> entry = it.next();
+            builder.startObject(entry.key);
+            builder.byteSizeField(Fields.SIZE_IN_BYTES, Fields.SIZE, entry.value);
+            builder.field(Fields.DESCRIPTION, descriptions.getOrDefault(entry.key, "Others"));
+            builder.endObject();
+        }
+        builder.endObject();
         builder.endObject();
         return builder;
     }
@@ -113,5 +180,7 @@ public class StoreStats implements Streamable, ToXContent {
         static final XContentBuilderString SIZE_IN_BYTES = new XContentBuilderString("size_in_bytes");
         static final XContentBuilderString THROTTLE_TIME = new XContentBuilderString("throttle_time");
         static final XContentBuilderString THROTTLE_TIME_IN_MILLIS = new XContentBuilderString("throttle_time_in_millis");
+        static final XContentBuilderString DETAIL = new XContentBuilderString("detail");
+        static final XContentBuilderString DESCRIPTION = new XContentBuilderString("description");
     }
 }
